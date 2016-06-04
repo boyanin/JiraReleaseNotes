@@ -1,0 +1,144 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<meta-runner>
+  <name>JIRA: Release notes</name>
+  <description>Creates release notes from both JIRA and VSC commits</description>
+  <settings>
+    <parameters>
+      <param name="mr.JiraReleaseNotes.JiraServer" value="" spec="text description='Url of Jira server.' display='normal' label='Jira Server:' validationMode='any'" />
+      <param name="mr.JiraReleaseNotes.ProjectId" value="" spec="text description='Issue tracker project ID.' display='normal' label='Project Id:' validationMode='any'" />
+      <param name="mr.JiraReleaseNotes.Username" value="" spec="text description='Issue tracker username.' display='normal' label='Username:' validationMode='any'" />
+      <param name="mr.JiraReleaseNotes.Password" value="" spec="password description='Issue tracker password.' display='normal' label='Password:' validationMode='any'" />
+      <param name="mr.JiraReleaseNotes.OutputFile" value="" spec="text description='The output release notes file' display='normal' label='Output file:'" />
+    </parameters>
+    <build-runners>
+      <runner name="JiraReleaseNotes" type="jetbrains_powershell">
+        <parameters>
+          <param name="jetbrains_powershell_execution" value="PS1" />
+          <param name="jetbrains_powershell_noprofile" value="true" />
+          <param name="jetbrains_powershell_errorToError" value="error" />
+          <param name="jetbrains_powershell_script_mode" value="CODE" />
+          <param name="jetbrains_powershell_bitness" value="x64" />
+          <param name="teamcity.step.mode" value="default" />
+          <param name="jetbrains_powershell_script_code"><![CDATA[[CmdletBinding()]
+Param (
+  [string] $JiraServer = "%mr.JiraReleaseNotes.JiraServer%",
+  [string] $ProjectId = "%mr.JiraReleaseNotes.ProjectId%",
+  [string] $Username = "%mr.JiraReleaseNotes.Username%",
+  [string] $Password = "%mr.JiraReleaseNotes.Password%",
+  [string] $OutputFile = (Join-Path "%teamcity.build.workingDir%" "%mr.JiraReleaseNotes.OutputFile%")
+)
+
+# These will be replaced by TeamCity based on the current build
+$currentVersion = "%teamcity.build.number"
+$currentBuildId = %teamcity.build.id%
+$currentBuildTypeId = "%system.teamcity.buildType.id%"
+$teamcityUrl = "%teamcity.serverUrl%"
+$teamcityAuthToken = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("%system.teamcity.auth.userId%:%system.teamcity.auth.password%"))
+
+function TeamCityApiRequest($url, $authToken) {
+    $request = [System.Net.WebRequest]::Create("$url")
+    $request.Headers.Add("Authorization", "Basic $authToken");
+    return [xml](new-object System.IO.StreamReader $request.GetResponse().GetResponseStream()).ReadToEnd()
+}
+
+function ParseCommitMessages($teamcityUrl, $authToken, $changeHref) {
+  $responseXml = [xml](TeamCityApiRequest "$($teamcityUrl)$($changeHref)" $authToken)
+  return Microsoft.PowerShell.Utility\Select-Xml $responseXml -XPath "/change" |
+    % { $_.Node["comment"].InnerText.Trim() } |
+    where { ($_.Length -ne 0) -and (-Not $_.Contains('#ignore')) -and (-Not $_.StartsWith('Merge branch'))} |
+    select-object -Unique |
+    foreach {"$($_.Replace("`n"," "))`n"}
+}
+
+# There could be multiple builds with the same version number, so we have
+# to find the first one in order to get the correct changeset
+function FindFirstBuildIdForVersion($teamcityUrl, $authToken, $buildTypeId, $version) {
+    $responseXml = [xml](TeamCityApiRequest "$teamcityUrl/httpAuth/app/rest/builds/?locator=buildType:(id:$($buildTypeId))" $authToken)
+    [array]$builds = Microsoft.PowerShell.Utility\Select-Xml $responseXml -XPath "/builds/build" | 
+        where { $_.Node.number -eq $version } |
+        % { $_.Node.id }
+
+    if ($builds.Length -gt 0) {
+        return $builds[$builds.Length - 1]
+    }
+    else {
+        return $null
+    }
+}
+
+function FindChangesSinceLastBuild($teamcityUrl, $authToken, $buildTypeId, $version) {
+    $buildId = FindFirstBuildIdForVersion $teamcityUrl $authToken $buildTypeId $version
+    if ($buildId) {
+        Write-Host "Found multiple builds with same version. Taking the first build with id $buildId"
+    }
+    else {
+        Write-Host "Looking for changes in build $buildId"
+    }
+
+    $responseXml = [xml](TeamCityApiRequest "$teamcityUrl/httpAuth/app/rest/changes?build=id:$($buildId)" $authToken)
+    return Microsoft.PowerShell.Utility\Select-Xml $responseXml -XPath "/changes/change" | 
+        % { ParseCommitMessages $teamcityUrl $authToken $_.Node.href } |
+        select-object -Unique
+}
+
+$changesSinceLastBuild = FindChangesSinceLastBuild $teamcityUrl $teamcityAuthToken $currentBuildTypeId $currentVersion
+$jiraPattern = '^(' + $ProjectId + '\-\d+)([\:\s\-]?\s+(.+))?'
+
+[array]$jiraRelatedChanges = $changesSinceLastBuild |
+    foreach { $_.Split("`n") } |
+    where { $_.Length -gt 0 } |
+    select-string $jiraPattern |
+    foreach { @{ key = $_.Matches[0].Groups[1].Value; comment = $_.Matches[0].Groups[3].Value; } }
+
+$jiraTexts = @()
+if ($jiraRelatedChanges.Length -gt 0) {
+    $tasksEscaped = ($jiraRelatedChanges | % { $_.key } | select-object -Unique | % { "'$($_)'" }) -join ","
+    Write-Host "Following JIRA tasks found in the commits: $tasksEscaped"
+
+    $jql = "project = $ProjectId AND key in ($tasksEscaped)"
+    try {
+        # Import the JIRA module
+        Import-Module PSJira\PSJira
+        Set-JiraConfigServer $JiraServer -ConfigFile "psjira.config"
+
+        # Initiate a new session
+        $securePassword = ConvertTo-SecureString $Password -AsPlainText -Force
+        $credential = New-Object System.Management.Automation.PSCredential ($Username, $securePassword)
+        New-JiraSession -Credential $credential
+
+        # Search for JIRA tasks
+        $jiraHash = @{}
+        $jiraTasks = Get-JiraIssue -Query $jql
+        foreach ($jiraTask in $jiraTasks) {
+            $jiraHash.Add("$($jiraTask.Key)", $jiraTask.Summary)
+        }
+
+        # Group the commits by their JIRA tasks
+        $jiraTexts = $jiraRelatedChanges |
+            % { New-Object PSObject -Property $_ } |
+            group-object -property key |
+            foreach { "+ $($_.Name): $($jiraHash.Get_Item($_.Name))`r`n$(($_.Group | % { "  + $($_.comment)" }) -join "`r`n")`r`n" }
+    }
+    catch {
+        Write-Host "##teamcity[message text='$_' status='ERROR']"
+    }
+}
+else {
+    Write-Host "No JIRA tasks found in commits"
+}
+
+$generalTexts = $changesSinceLastBuild |
+    foreach { $_.Split("`n") } |
+    where { ($_.Length -gt 0) -and (-not ($_ -match $jiraPattern)) } |
+    foreach { "+ $_" }
+
+$releaseNotes = $jiraTexts + $generalTexts
+$releaseNotes > $OutputFile
+Write-Host "Release notes saved to ${OutputFile}:"
+$releaseNotes]]></param>
+        </parameters>
+      </runner>
+    </build-runners>
+    <requirements />
+  </settings>
+</meta-runner>
